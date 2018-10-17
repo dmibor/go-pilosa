@@ -19,34 +19,43 @@ func newRecordImportManager(client *Client) *recordImportManager {
 }
 
 type importWorkerChannels struct {
-	records <-chan Record
+	batches <-chan map[uint64][]Record
 	errs    chan<- error
 	status  chan<- ImportStatusUpdate
 }
 
 func (rim recordImportManager) Run(field *Field, iterator RecordIterator, options ImportOptions) error {
 	shardWidth := options.shardWidth
-	threadCount := uint64(options.threadCount)
-	recordChans := make([]chan Record, threadCount)
+	threadCount := options.threadCount
+	batchesChan := make(chan map[uint64][]Record, threadCount)
 	errChan := make(chan error)
 	statusChan := options.statusChan
+	batchSize := options.batchSize
 
 	if options.importRecordsFunction == nil {
 		return errors.New("importRecords function is required")
 	}
 
-	for i := range recordChans {
-		recordChans[i] = make(chan Record, options.batchSize)
-		chans := importWorkerChannels{
-			records: recordChans[i],
-			errs:    errChan,
-			status:  statusChan,
+	for i := 0; i < threadCount; i++ {
+		r := &recordImportWorker{
+			id:             i,
+			client:         rim.client,
+			field:          field,
+			pendingRecords: make(map[uint64][]Record),
+			chans: importWorkerChannels{
+				batches: batchesChan,
+				errs:    errChan,
+				status:  statusChan,
+			},
+			options: options,
 		}
-		go recordImportWorker(i, rim.client, field, chans, options)
+		go r.Start()
 	}
 
 	var record Record
 	var recordIteratorError error
+	var recordCount int
+	batchForShard := map[uint64][]Record{}
 
 	for {
 		record, recordIteratorError = iterator.NextRecord()
@@ -56,31 +65,41 @@ func (rim recordImportManager) Run(field *Field, iterator RecordIterator, option
 			}
 			break
 		}
+		//dont think this way of distributing records to recordChans is optimal
+		//a lot of blocking to non-empty channels that can be making progress from full channels that
+		//are in process to being uploaded and waiting for pilosa cluster, especially noticable with
+		//large batch sizes
+
+		// shard := record.Shard(shardWidth)
+		// recordChans[shard%threadCount] <- record
+
+		//will try different approach
+		recordCount++
 		shard := record.Shard(shardWidth)
-		//try to submit to channel and push to the beginning of the queue if it would block.
-		select {
-		case recordChans[shard%threadCount] <- record:
-		default:
-			iterator.ToBeginning(record)
+		batchForShard[shard] = append(batchForShard[shard], record)
+
+		if recordCount >= batchSize {
+			batchesChan <- batchForShard
+			batchForShard = make(map[uint64][]Record)
+			recordCount = 0
+
 		}
 	}
 
-	for _, q := range recordChans {
-		close(q)
-	}
+	close(batchesChan)
 
 	if recordIteratorError != nil {
 		return recordIteratorError
 	}
 
-	done := uint64(0)
+	done := 0
 	for {
 		select {
 		case workerErr := <-errChan:
 			if workerErr != nil {
 				return workerErr
 			}
-			done += 1
+			done++
 			if done == threadCount {
 				return nil
 			}
@@ -88,12 +107,26 @@ func (rim recordImportManager) Run(field *Field, iterator RecordIterator, option
 	}
 }
 
-func recordImportWorker(id int, client *Client, field *Field, chans importWorkerChannels, options ImportOptions) {
-	batchForShard := map[uint64][]Record{}
-	importFun := options.importRecordsFunction
-	statusChan := chans.status
-	recordChan := chans.records
-	errChan := chans.errs
+//max number of records held before sending request to the cluster
+//to avoid flooding cluster with tons of tiny batches for shards
+//but can't be too big too, since records would be held in memory for every shard
+const maxPendingRecords = 10000
+
+//changing this from simple function so that can keep state for pendingRecord here
+type recordImportWorker struct {
+	id             int
+	pendingRecords map[uint64][]Record
+	client         *Client
+	field          *Field
+	chans          importWorkerChannels
+	options        ImportOptions
+}
+
+func (w *recordImportWorker) Start() {
+	importFun := w.options.importRecordsFunction
+	statusChan := w.chans.status
+	batchesChan := w.chans.batches
+	errChan := w.chans.errs
 	shardNodes := map[uint64][]fragmentNode{}
 
 	importRecords := func(shard uint64, records []Record) error {
@@ -102,14 +135,14 @@ func recordImportWorker(id int, client *Client, field *Field, chans importWorker
 		var err error
 		if nodes, ok = shardNodes[shard]; !ok {
 			// if the data has row or column keys, send the data only to the coordinator
-			if field.index.options.keys || field.options.keys {
-				node, err := client.fetchCoordinatorNode()
+			if w.field.index.options.keys || w.field.options.keys {
+				node, err := w.client.fetchCoordinatorNode()
 				if err != nil {
 					return err
 				}
 				nodes = []fragmentNode{node}
 			} else {
-				nodes, err = client.fetchFragmentNodes(field.index.name, shard)
+				nodes, err = w.client.fetchFragmentNodes(w.field.index.name, shard)
 				if err != nil {
 					return err
 				}
@@ -117,14 +150,14 @@ func recordImportWorker(id int, client *Client, field *Field, chans importWorker
 		}
 		tic := time.Now()
 		sort.Sort(recordSort(records))
-		err = importFun(field, shard, records, nodes, &options)
+		err = importFun(w.field, shard, records, nodes, &w.options)
 		if err != nil {
 			return err
 		}
 		took := time.Since(tic)
 		if statusChan != nil {
 			statusChan <- ImportStatusUpdate{
-				ThreadID:      id,
+				ThreadID:      w.id,
 				Shard:         shard,
 				ImportedCount: len(records),
 				Time:          took,
@@ -134,27 +167,25 @@ func recordImportWorker(id int, client *Client, field *Field, chans importWorker
 	}
 
 	var err error
-	recordCount := 0
-	batchSize := options.batchSize
-	shardWidth := options.shardWidth
 
-	for record := range recordChan {
-		recordCount += 1
-		shard := record.Shard(shardWidth)
-		batchForShard[shard] = append(batchForShard[shard], record)
-
-		if recordCount >= batchSize {
-			for shard, records := range batchForShard {
-				if len(records) == 0 {
-					continue
-				}
-				err = importRecords(shard, records)
-				if err != nil {
-					break
-				}
-				batchForShard[shard] = nil
+	for batchForShard := range batchesChan {
+		for shard, records := range batchForShard {
+			pending := w.pendingRecords[shard]
+			if len(records)+len(pending) < maxPendingRecords {
+				//if number of records too small - add to pending and continue
+				w.pendingRecords[shard] = append(pending, records...)
+				continue
 			}
-			recordCount = 0
+			//add pending records
+			if len(pending) != 0 {
+				records = append(records, pending...)
+				w.pendingRecords[shard] = nil
+			}
+			err = importRecords(shard, records)
+			if err != nil {
+				//take fail-fast approach for now
+				panic(err)
+			}
 		}
 	}
 
@@ -163,14 +194,15 @@ func recordImportWorker(id int, client *Client, field *Field, chans importWorker
 		return
 	}
 
-	// import remaining records
-	for shard, records := range batchForShard {
+	// import remaining pending records
+	for shard, records := range w.pendingRecords {
 		if len(records) == 0 {
 			continue
 		}
 		err = importRecords(shard, records)
 		if err != nil {
-			break
+			//take fail-fast approach for now
+			panic(err)
 		}
 	}
 

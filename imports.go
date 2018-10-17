@@ -39,7 +39,6 @@ type Record interface {
 
 type RecordIterator interface {
 	NextRecord() (Record, error)
-	ToBeginning(Record) (error)
 }
 
 // Column defines a single Pilosa column.
