@@ -110,12 +110,17 @@ func (rim recordImportManager) Run(field *Field, iterator RecordIterator, option
 //max number of records held before sending request to the cluster
 //to avoid flooding cluster with tons of tiny batches for shards
 //but can't be too big too, since records would be held in memory for every shard
+//also important that this param is less than batch size - otherwise noting gets send
 const maxPendingRecords = 10000
 
 //changing this from simple function so that can keep state for pendingRecord here
 type recordImportWorker struct {
-	id             int
+	id int
+	//TODO
+	//holding it here is naive and bad solution, here only for now - this should be shared between import
+	//workers for it to have any noticable effect
 	pendingRecords map[uint64][]Record
+	
 	client         *Client
 	field          *Field
 	chans          importWorkerChannels
