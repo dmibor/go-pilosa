@@ -57,7 +57,12 @@ func (rim recordImportManager) Run(field *Field, iterator RecordIterator, option
 			break
 		}
 		shard := record.Shard(shardWidth)
-		recordChans[shard%threadCount] <- record
+		//try to submit to channel and push to the beginning of the queue if it would block.
+		select {
+		case recordChans[shard%threadCount] <- record:
+		default:
+			iterator.ToBeginning(record)
+		}
 	}
 
 	for _, q := range recordChans {
